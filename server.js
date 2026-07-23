@@ -8,6 +8,19 @@ app.use(cors());
 app.use(express.json());
 
 // ==========================================
+// HEALTH CHECK ENDPOINT
+// ==========================================
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    version: '1.0.0'
+  });
+});
+
+// ==========================================
 // ADVANCED MINIMAX ENGINE WITH ALPHA-BETA
 // ==========================================
 
@@ -181,26 +194,319 @@ class AdvancedMinimaxEngine extends FastCaroEngine {
   }
 }
 
-const engine = new AdvancedMinimaxEngine(3);
+// ==========================================
+// 6. BOT LOGIC CHO SERVER
+// ==========================================
 
-// ==========================================
-// API ENDPOINT
-// ==========================================
-app.post('/api/get-move', (req, res) => {
-  try {
-    const { board, size } = req.body;
-    if (!board || !size) {
-      return res.status(400).json({ success: false, error: 'Thiếu dữ liệu board hoặc size!' });
+class CaroBotServer {
+  constructor() {
+    this.engine = new AdvancedMinimaxEngine(3);
+    this.lastBoardState = null;
+    this.gameConfig = {
+      botPlayer: 1, // Bot là player 1 (O)
+      humanPlayer: 2 // Human là player 2 (X)
+    };
+  }
+
+  // Phân tích bàn cờ và xác định lượt chơi
+  analyzeBoard(board, size) {
+    let botPieces = 0;
+    let humanPieces = 0;
+
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (board[r][c] === this.gameConfig.botPlayer) botPieces++;
+        if (board[r][c] === this.gameConfig.humanPlayer) humanPieces++;
+      }
     }
 
-    const bestMove = engine.findBestMove(board, size);
-    res.json({ success: true, move: bestMove });
+    // Bot đi nếu số quân bằng nhau hoặc bot ít hơn (lượt của bot)
+    const isBotTurn = botPieces <= humanPieces;
+    const isGameOver = this.checkWin(board, size);
+
+    return {
+      isBotTurn,
+      isGameOver,
+      botPieces,
+      humanPieces,
+      totalMoves: botPieces + humanPieces
+    };
+  }
+
+  // Kiểm tra thắng cuộc
+  checkWin(board, size) {
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (board[r][c] === 0) continue;
+        const player = board[r][c];
+        
+        for (const [dr, dc] of this.engine.DIRS) {
+          let count = 1;
+          for (let step = 1; step < 5; step++) {
+            const nr = r + dr * step, nc = c + dc * step;
+            if (nr >= 0 && nr < size && nc >= 0 && nc < size && board[nr][nc] === player) {
+              count++;
+            } else break;
+          }
+          for (let step = 1; step < 5; step++) {
+            const nr = r - dr * step, nc = c - dc * step;
+            if (nr >= 0 && nr < size && nc >= 0 && nc < size && board[nr][nc] === player) {
+              count++;
+            } else break;
+          }
+          if (count >= 5) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Lấy nước đi tốt nhất
+  getBestMove(board, size) {
+    // Kiểm tra bàn cờ hợp lệ
+    if (!board || !size || size < 5) {
+      return { error: 'Bàn cờ không hợp lệ' };
+    }
+
+    // Clone board để tránh sửa đổi
+    const boardClone = board.map(row => [...row]);
+
+    // Phân tích trạng thái
+    const analysis = this.analyzeBoard(boardClone, size);
+    
+    if (analysis.isGameOver) {
+      return { 
+        error: 'Trò chơi đã kết thúc',
+        analysis 
+      };
+    }
+
+    if (!analysis.isBotTurn) {
+      return { 
+        error: 'Không phải lượt của bot',
+        analysis 
+      };
+    }
+
+    // Tìm nước đi tốt nhất
+    const bestMove = this.engine.findBestMove(boardClone, size);
+    
+    if (!bestMove) {
+      return { 
+        error: 'Không tìm thấy nước đi hợp lệ',
+        analysis 
+      };
+    }
+
+    // Kiểm tra nước đi có hợp lệ không
+    if (boardClone[bestMove.r][bestMove.c] !== 0) {
+      return { 
+        error: 'Nước đi không hợp lệ - ô đã bị chiếm',
+        analysis 
+      };
+    }
+
+    return {
+      move: bestMove,
+      analysis,
+      evaluation: this.engine.evaluateBoardTotal(boardClone, size)
+    };
+  }
+
+  // Lấy gợi ý nước đi (không cần là lượt của bot)
+  getSuggestion(board, size) {
+    const boardClone = board.map(row => [...row]);
+    const bestMove = this.engine.findBestMove(boardClone, size);
+    
+    if (!bestMove) {
+      return { error: 'Không tìm thấy nước đi hợp lệ' };
+    }
+
+    return {
+      move: bestMove,
+      evaluation: this.engine.evaluateBoardTotal(boardClone, size)
+    };
+  }
+
+  // Đánh giá bàn cờ
+  evaluateBoard(board, size) {
+    return {
+      score: this.engine.evaluateBoardTotal(board, size),
+      analysis: this.analyzeBoard(board, size)
+    };
+  }
+}
+
+// Tạo instance bot
+const bot = new CaroBotServer();
+
+// ==========================================
+// 7. API ENDPOINTS
+// ==========================================
+
+// Endpoint chính: Lấy nước đi cho bot
+app.post('/api/get-move', (req, res) => {
+  try {
+    const { board, size, mode = 'auto' } = req.body;
+    
+    if (!board || !size) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Thiếu dữ liệu board hoặc size!' 
+      });
+    }
+
+    // Kiểm tra kích thước board
+    if (!Array.isArray(board) || board.length !== size || !board.every(row => row.length === size)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Board không khớp với size!'
+      });
+    }
+
+    let result;
+
+    if (mode === 'suggest') {
+      // Chế độ gợi ý (không cần lượt bot)
+      result = bot.getSuggestion(board, size);
+    } else {
+      // Chế độ tự động (cần lượt bot)
+      result = bot.getBestMove(board, size);
+    }
+
+    if (result.error) {
+      return res.status(400).json({
+        success: false,
+        error: result.error,
+        analysis: result.analysis || null
+      });
+    }
+
+    res.json({
+      success: true,
+      move: result.move,
+      analysis: result.analysis || null,
+      evaluation: result.evaluation || null
+    });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, error: 'Lỗi xử lý server nội bộ.' });
+    console.error('Error in /api/get-move:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Lỗi xử lý server nội bộ.' 
+    });
   }
 });
 
+// Endpoint: Đánh giá bàn cờ
+app.post('/api/evaluate', (req, res) => {
+  try {
+    const { board, size } = req.body;
+    
+    if (!board || !size) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Thiếu dữ liệu board hoặc size!' 
+      });
+    }
+
+    const evaluation = bot.evaluateBoard(board, size);
+    res.json({
+      success: true,
+      evaluation
+    });
+
+  } catch (error) {
+    console.error('Error in /api/evaluate:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Lỗi xử lý server nội bộ.' 
+    });
+  }
+});
+
+// Endpoint: Kiểm tra trạng thái bàn cờ
+app.post('/api/analyze', (req, res) => {
+  try {
+    const { board, size } = req.body;
+    
+    if (!board || !size) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Thiếu dữ liệu board hoặc size!' 
+      });
+    }
+
+    const analysis = bot.analyzeBoard(board, size);
+    res.json({
+      success: true,
+      analysis
+    });
+
+  } catch (error) {
+    console.error('Error in /api/analyze:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Lỗi xử lý server nội bộ.' 
+    });
+  }
+});
+
+// Endpoint: Lấy danh sách nước đi tiềm năng
+app.post('/api/candidates', (req, res) => {
+  try {
+    const { board, size } = req.body;
+    
+    if (!board || !size) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Thiếu dữ liệu board hoặc size!' 
+      });
+    }
+
+    const candidates = bot.engine.getCandidates(board, size);
+    res.json({
+      success: true,
+      candidates,
+      total: candidates.length
+    });
+
+  } catch (error) {
+    console.error('Error in /api/candidates:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Lỗi xử lý server nội bộ.' 
+    });
+  }
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Caro Bot Server API',
+    version: '1.0.0',
+    endpoints: {
+      'GET /health': 'Kiểm tra sức khỏe server',
+      'POST /api/get-move': 'Lấy nước đi cho bot (mode: auto|suggest)',
+      'POST /api/evaluate': 'Đánh giá bàn cờ',
+      'POST /api/analyze': 'Phân tích trạng thái bàn cờ',
+      'POST /api/candidates': 'Lấy danh sách nước đi tiềm năng'
+    },
+    bot_config: {
+      maxDepth: 3,
+      botPlayer: 1,
+      humanPlayer: 2
+    }
+  });
+});
+
+// ==========================================
+// 8. START SERVER
+// ==========================================
+
 app.listen(PORT, () => {
-  console.log(`🚀 Server Caro API đang chạy tại cổng: ${PORT}`);
+  console.log(`🚀 Caro Bot Server đang chạy tại cổng: ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`🤖 Bot depth: 3`);
+  console.log(`🎯 Bot player: 1 (O), Human player: 2 (X)`);
 });
