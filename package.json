@@ -1,5 +1,5 @@
 {
-  "name": "caro-bot-server",
+  "name": "caro-server-bot",
   "version": "1.0.0",
   "description": "Caro Bot API Server",
   "main": "server.js",
